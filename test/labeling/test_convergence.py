@@ -1,18 +1,15 @@
+import random
 import unittest
 
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 
-from snorkel.labeling import (
-    LabelingFunction,
-    LabelModel,
-    PandasLFApplier,
-    labeling_function,
-)
+from snorkel.labeling import LabelingFunction, PandasLFApplier, labeling_function
+from snorkel.labeling.model import LabelModel
 from snorkel.preprocess import preprocessor
 from snorkel.types import DataPoint
-from snorkel.utils import set_seed
 
 
 def create_data(n: int) -> pd.DataFrame:
@@ -61,7 +58,9 @@ class LabelingConvergenceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # Ensure deterministic runs
-        set_seed(123)
+        random.seed(123)
+        np.random.seed(123)
+        torch.manual_seed(123)
 
         # Create raw data
         cls.N_TRAIN = 1500

@@ -23,7 +23,7 @@ tox --devenv .env
 
 Running `tox --devenv .env` will install create a virtual environment with Snorkel
 and all of its dependencies installed in the directory `.env`.
-This can be used in a number of ways, e.g. with `conda activate`
+This can be used in a number of ways, e.g. with `source .env/bin/activate`
 or for [linting in VSCode](https://code.visualstudio.com/docs/python/environments#_where-the-extension-looks-for-environments).
 For example, you can simply activate this environment and start using Snorkel:
 
@@ -60,7 +60,7 @@ We use the following packages:
 * [black](https://black.readthedocs.io/en/stable/): automatic code formatting
 * [flake8](http://flake8.pycqa.org/en/latest/): PEP8 linting
 * [mypy](http://mypy-lang.org/): static type checking
-* [pydocstyle](http://mypy-lang.org/): docstring compliance
+* [pydocstyle](http://www.pydocstyle.org/): docstring compliance
 * [doctest-plus](https://github.com/astropy/pytest-doctestplus): check docstring code examples
 
 The Snorkel maintainers are big fans of [VSCode](https://code.visualstudio.com/)'s Python tooling.
@@ -127,7 +127,7 @@ installing Java and the large PySpark package.
 They are executed on Travis, but not by default for a local `tox` command.
 If you're making changes to Spark-based operators, make sure you have
 Java 8 installed locally and then run `tox -e spark`.
-If you add a test that imports PySpark mark it with the 
+If you add a test that imports PySpark mark it with the
 `@pytest.mark.spark` decorator.
 Add the `@pytest.mark.complex` decorator as well if it runs a Spark
 action (e.g. `.collect()`).
@@ -161,4 +161,5 @@ We ask that you make sure initial CI checks are passing before requesting a revi
 ### Merging
 
 The PR author owns the test plan and has final say on correctness.
-Therefore, it is up to the PR author to merge their PR.
+Therefore, it is up to the PR author to give the final okay on merging
+(or merge their PR if they have write access).

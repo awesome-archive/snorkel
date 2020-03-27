@@ -1,19 +1,20 @@
 import logging
-from collections import Counter
+import random
+from collections import Counter, defaultdict
 from itertools import chain
-from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple, Union
+from typing import Any, DefaultDict, Dict, List, NamedTuple, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from munkres import Munkres  # type: ignore
 
-from snorkel.analysis import Scorer
 from snorkel.labeling.analysis import LFAnalysis
+from snorkel.labeling.model.base_labeler import BaseLabeler
 from snorkel.labeling.model.graph_utils import get_clique_tree
 from snorkel.labeling.model.logger import Logger
 from snorkel.types import Config
-from snorkel.utils import probs_to_preds, set_seed
 from snorkel.utils.config_utils import merge_config
 from snorkel.utils.lr_schedulers import LRSchedulerConfig
 from snorkel.utils.optimizers import OptimizerConfig
@@ -46,6 +47,8 @@ class TrainConfig(Config):
         A random seed to initialize the random number generator with
     log_freq
         Report loss every this many epochs (steps)
+    mu_eps
+        Restrict the learned conditional probabilities to [mu_eps, 1-mu_eps]
     """
 
     n_epochs: int = 100
@@ -58,6 +61,7 @@ class TrainConfig(Config):
     prec_init: float = 0.7
     seed: int = np.random.randint(1e6)
     log_freq: int = 10
+    mu_eps: Optional[float] = None
 
 
 class LabelModelConfig(Config):
@@ -81,8 +85,23 @@ class _CliqueData(NamedTuple):
     max_cliques: Set[int]
 
 
-class LabelModel(nn.Module):
-    """A conditionally independent LabelModel to learn LF weights and assign training labels.
+class LabelModel(nn.Module, BaseLabeler):
+    r"""A model for learning the LF accuracies and combining their output labels.
+
+    This class learns a model of the labeling functions' conditional probabilities
+    of outputting the true (unobserved) label `Y`, `P(\lf | Y)`, and uses this learned
+    model to re-weight and combine their output labels.
+
+    This class is based on the approach in [Training Complex Models with Multi-Task
+    Weak Supervision](https://arxiv.org/abs/1810.02840), published in AAAI'19. In this
+    approach, we compute the inverse generalized covariance matrix of the junction tree
+    of a given LF dependency graph, and perform a matrix completion-style approach with
+    respect to these empirical statistics. The result is an estimate of the conditional
+    LF probabilities, `P(\lf | Y)`, which are then set as the parameters of the label
+    model used to re-weight and combine the labels output by the LFs.
+
+    Currently this class uses a conditionally independent label model, in which the LFs
+    are assumed to be conditionally independent given `Y`.
 
     Examples
     --------
@@ -233,7 +252,9 @@ class LabelModel(nn.Module):
         """
         L_aug = self._get_augmented_label_matrix(L, higher_order=higher_order)
         self.d = L_aug.shape[1]
-        self.O = torch.from_numpy(L_aug.T @ L_aug / self.n).float()
+        self.O = (
+            torch.from_numpy(L_aug.T @ L_aug / self.n).float().to(self.config.device)
+        )
 
     def _init_params(self) -> None:
         r"""Initialize the learned params.
@@ -264,7 +285,7 @@ class LabelModel(nn.Module):
 
         # Get the per-value labeling propensities
         # Note that self.O must have been computed already!
-        lps = torch.diag(self.O).numpy()
+        lps = torch.diag(self.O).cpu().detach().numpy()
 
         # TODO: Update for higher-order cliques!
         self.mu_init = torch.zeros(self.d, self.cardinality)
@@ -280,53 +301,57 @@ class LabelModel(nn.Module):
         # Build the mask over O^{-1}
         self._build_mask()
 
-    def _get_conditional_probs(self, source: Optional[int] = None) -> np.ndarray:
-        r"""Return the full conditional probabilities table.
+    def _get_conditional_probs(self, mu: np.ndarray) -> np.ndarray:
+        r"""Return the estimated conditional probabilities table given parameters mu.
 
-        In cond. prob. table, row i*(k+1) + ly is the conditional probabilities of source i
-        emmiting label ly (including abstains 0), conditioned on different
-        values of Y, i.e.:
+        Given a parameter vector mu, return the estimated conditional probabilites
+        table cprobs, where cprobs is an (m, k+1, k)-dim np.ndarray with:
 
-            c_probs[i*(k+1) + ly, y] = P(\lambda_i = ly | Y = y)
+            cprobs[i, j, k] = P(\lf_i = j-1 | Y = k)
 
-        Note that this simply involves inferring the kth row by law of total
-        probability and adding in to mu.
-
-        If ``source`` is not None, returns only the corresponding block.
+        where m is the number of LFs, k is the cardinality, and cprobs includes the
+        conditional abstain probabilities P(\lf_i = -1 | Y = y).
 
         Parameters
         ----------
-        source
-            Index of source to generate conditional probabilities for, by default None
+        mu
+            An [m * k, k] np.ndarray with entries in [0, 1]
 
         Returns
         -------
         np.ndarray
-            Conditional probabilities table if source is None, else corresponding block
+            An [m, k + 1, k] np.ndarray conditional probabilities table.
         """
-        c_probs = np.zeros((self.m * (self.cardinality + 1), self.cardinality))
-        mu = self.mu.detach().clone().numpy()
-
+        cprobs = np.zeros((self.m, self.cardinality + 1, self.cardinality))
         for i in range(self.m):
             # si = self.c_data[(i,)]['start_index']
             # ei = self.c_data[(i,)]['end_index']
             # mu_i = mu[si:ei, :]
             mu_i = mu[i * self.cardinality : (i + 1) * self.cardinality, :]
-            c_probs[
-                i * (self.cardinality + 1) + 1 : (i + 1) * (self.cardinality + 1), :
-            ] = mu_i
+            cprobs[i, 1:, :] = mu_i
 
             # The 0th row (corresponding to abstains) is the difference between
-            # the sums of the other rows and one, by law of total prob
-            c_probs[i * (self.cardinality + 1), :] = 1 - mu_i.sum(axis=0)
-        c_probs = np.clip(c_probs, 0.01, 0.99)
+            # the sums of the other rows and one, by law of total probability
+            cprobs[i, 0, :] = 1 - mu_i.sum(axis=0)
+        return cprobs
 
-        if source is not None:
-            return c_probs[
-                source * (self.cardinality + 1) : (source + 1) * (self.cardinality + 1)
-            ]
-        else:
-            return c_probs
+    def get_conditional_probs(self) -> np.ndarray:
+        r"""Return the estimated conditional probabilities table.
+
+        Return the estimated conditional probabilites table cprobs, where cprobs is an
+        (m, k+1, k)-dim np.ndarray with:
+
+            cprobs[i, j, k] = P(\lf_i = j-1 | Y = k)
+
+        where m is the number of LFs, k is the cardinality, and cprobs includes the
+        conditional abstain probabilities P(\lf_i = -1 | Y = y).
+
+        Returns
+        -------
+        np.ndarray
+            An [m, k + 1, k] np.ndarray conditional probabilities table.
+        """
+        return self._get_conditional_probs(self.mu.cpu().detach().numpy())
 
     def get_weights(self) -> np.ndarray:
         """Return the vector of learned LF weights for combining LFs.
@@ -345,10 +370,9 @@ class LabelModel(nn.Module):
         array([0.99, 0.99, 0.99])
         """
         accs = np.zeros(self.m)
+        cprobs = self.get_conditional_probs()
         for i in range(self.m):
-            cps = self._get_conditional_probs(source=i)[1:, :]
-            accs[i] = np.diag(cps @ self.P.numpy()).sum()
-
+            accs[i] = np.diag(cprobs[i, 1:, :] @ self.P.cpu().detach().numpy()).sum()
         return np.clip(accs / self.coverage, 1e-6, 1.0)
 
     def predict_proba(self, L: np.ndarray) -> np.ndarray:
@@ -357,7 +381,7 @@ class LabelModel(nn.Module):
         Parameters
         ----------
         L
-            An [n,m] matrix with values in {-1,0,1,...,k-1}
+            An [n,m] matrix with values in {-1,0,1,...,k-1}f
 
         Returns
         -------
@@ -377,7 +401,7 @@ class LabelModel(nn.Module):
         L_shift = L + 1  # convert to {0, 1, ..., k}
         self._set_constants(L_shift)
         L_aug = self._get_augmented_label_matrix(L_shift)
-        mu = np.clip(self.mu.detach().clone().numpy(), 0.01, 0.99)
+        mu = self.mu.cpu().detach().numpy()
         jtm = np.ones(L_aug.shape[1])
 
         # Note: We omit abstains, effectively assuming uniform distribution here
@@ -389,12 +413,12 @@ class LabelModel(nn.Module):
         self,
         L: np.ndarray,
         return_probs: Optional[bool] = False,
-        tie_break_policy: str = "random",
+        tie_break_policy: str = "abstain",
     ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         """Return predicted labels, with ties broken according to policy.
 
         Policies to break ties include:
-        "abstain": return an abstain vote (0)
+        "abstain": return an abstain vote (-1)
         "true-random": randomly choose among the tied options
         "random": randomly choose among tied option using deterministic hash
 
@@ -428,18 +452,14 @@ class LabelModel(nn.Module):
         >>> label_model.predict(L)
         array([0, 1, 0])
         """
-        Y_probs = self.predict_proba(L)
-        Y_p = probs_to_preds(Y_probs, tie_break_policy)
-        if return_probs:
-            return Y_p, Y_probs
-        return Y_p
+        return super(LabelModel, self).predict(L, return_probs, tie_break_policy)
 
     def score(
         self,
         L: np.ndarray,
         Y: np.ndarray,
         metrics: Optional[List[str]] = ["accuracy"],
-        tie_break_policy: str = "random",
+        tie_break_policy: str = "abstain",
     ) -> Dict[str, float]:
         """Calculate one or more scores from user-specified and/or user-defined metrics.
 
@@ -448,7 +468,7 @@ class LabelModel(nn.Module):
         L
             An [n,m] matrix with values in {-1,0,1,...,k-1}
         Y
-            Gold labels associated with datapoints in L
+            Gold labels associated with data points in L
         metrics
             A list of metric names
         tie_break_policy
@@ -470,13 +490,7 @@ class LabelModel(nn.Module):
         >>> label_model.score(L, Y=np.array([1, 1, 1]), metrics=["f1"])
         {'f1': 0.8}
         """
-        Y_pred, Y_prob = self.predict(
-            L, return_probs=True, tie_break_policy=tie_break_policy
-        )
-
-        scorer = Scorer(metrics=metrics)
-        results = scorer.score(Y, Y_pred, Y_prob)
-        return results
+        return super(LabelModel, self).score(L, Y, metrics, tie_break_policy)
 
     # These loss functions get all their data directly from the LabelModel
     # (for better or worse). The unused *args make these compatible with the
@@ -503,7 +517,7 @@ class LabelModel(nn.Module):
             D = l2 * torch.eye(self.d)
         else:
             D = torch.diag(torch.from_numpy(l2)).type(torch.float32)
-
+        D = D.to(self.config.device)
         # Note that mu is a matrix and this is the *Frobenius norm*
         return torch.norm(D @ (self.mu - self.mu_init)) ** 2
 
@@ -537,16 +551,31 @@ class LabelModel(nn.Module):
         """
         if class_balance is not None:
             self.p = np.array(class_balance)
+            if len(self.p) != self.cardinality:
+                raise ValueError(
+                    f"class_balance has {len(self.p)} entries. Does not match LabelModel cardinality {self.cardinality}."
+                )
         elif Y_dev is not None:
             class_counts = Counter(Y_dev)
             sorted_counts = np.array([v for k, v in sorted(class_counts.items())])
             self.p = sorted_counts / sum(sorted_counts)
+            if len(self.p) != self.cardinality:
+                raise ValueError(
+                    f"Y_dev has {len(self.p)} class(es). Does not match LabelModel cardinality {self.cardinality}."
+                )
         else:
             self.p = (1 / self.cardinality) * np.ones(self.cardinality)
-        self.P = torch.diag(torch.from_numpy(self.p)).float()
+
+        if np.any(self.p == 0):
+            raise ValueError(
+                f"Class balance prior is 0 for class(es) {np.where(self.p)[0]}."
+            )
+        self.P = torch.diag(torch.from_numpy(self.p)).float().to(self.config.device)
 
     def _set_constants(self, L: np.ndarray) -> None:
         self.n, self.m = L.shape
+        if self.m < 3:
+            raise ValueError(f"L_train should have at least 3 labeling functions")
         self.t = 1
 
     def _create_tree(self) -> None:
@@ -689,6 +718,76 @@ class LabelModel(nn.Module):
             if min_lr and self.optimizer.param_groups[0]["lr"] < min_lr:
                 self.optimizer.param_groups[0]["lr"] = min_lr
 
+    def _clamp_params(self) -> None:
+        """Clamp the values of the learned parameter vector.
+
+        Clamp the entries of self.mu to be in [mu_eps, 1 - mu_eps], where mu_eps is
+        either set by the user, or defaults to 1 / 10 ** np.ceil(np.log10(self.n)).
+
+        Note that if mu_eps is set too high, e.g. in sparse settings where LFs
+        mostly abstain, this will result in learning conditional probabilities all
+        equal to mu_eps (and/or 1 - mu_eps)!  See issue #1422.
+
+        Note: Use user-provided value of mu_eps in train_config, else default to
+            mu_eps = 1 / 10 ** np.ceil(np.log10(self.n))
+        this rounding is done to make it more obvious when the parameters have been
+        clamped.
+        """
+        if self.train_config.mu_eps is not None:
+            mu_eps = self.train_config.mu_eps
+        else:
+            mu_eps = min(0.01, 1 / 10 ** np.ceil(np.log10(self.n)))
+        self.mu.data = self.mu.clamp(mu_eps, 1 - mu_eps)  # type: ignore
+
+    def _break_col_permutation_symmetry(self) -> None:
+        r"""Heuristically choose amongst (possibly) several valid mu values.
+
+        If there are several values of mu that equivalently satisfy the optimization
+        objective, as there often are due to column permutation symmetries, then pick
+        the solution that trusts the user-written LFs most.
+
+        In more detail, suppose that mu satisfies (minimizes) the two loss objectives:
+            1. O = mu @ P @ mu.T
+            2. diag(O) = sum(mu @ P, axis=1)
+        Then any column permutation matrix Z that commutes with P will also equivalently
+        satisfy these objectives, and thus is an equally valid (symmetric) solution.
+        Therefore, we select the solution that maximizes the summed probability of the
+        LFs being accurate when not abstaining.
+
+            \sum_lf \sum_{y=1}^{cardinality} P(\lf = y, Y = y)
+        """
+        mu = self.mu.cpu().detach().numpy()
+        P = self.P.cpu().detach().numpy()
+        d, k = mu.shape
+        # We want to maximize the sum of diagonals of matrices for each LF. So
+        # we start by computing the sum of conditional probabilities here.
+        probs_sum = sum([mu[i : i + k] for i in range(0, self.m * k, k)]) @ P
+
+        munkres_solver = Munkres()
+        Z = np.zeros([k, k])
+
+        # Compute groups of indicess with equal prior in P.
+        groups: DefaultDict[float, List[int]] = defaultdict(list)
+        for i, f in enumerate(P.diagonal()):
+            groups[np.around(f, 3)].append(i)
+        for group in groups.values():
+            if len(group) == 1:
+                Z[group[0], group[0]] = 1.0  # Identity permutation
+                continue
+            # Compute submatrix corresponding to the group.
+            probs_proj = probs_sum[[[g] for g in group], group]
+            # Use the Munkres algorithm to find the optimal permutation.
+            # We use minus because we want to maximize diagonal sum, not minimize,
+            # and transpose because we want to permute columns, not rows.
+            permutation_pairs = munkres_solver.compute(-probs_proj.T)
+            for i, j in permutation_pairs:
+                Z[group[i], group[j]] = 1.0
+
+        # Set mu according to permutation
+        self.mu = nn.Parameter(
+            torch.Tensor(mu @ Z).to(self.config.device)  # type: ignore
+        )
+
     def fit(
         self,
         L_train: np.ndarray,
@@ -730,7 +829,9 @@ class LabelModel(nn.Module):
             TrainConfig(), kwargs  # type:ignore
         )
         # Update base config so that it includes all parameters
-        set_seed(self.train_config.seed)
+        random.seed(self.train_config.seed)
+        np.random.seed(self.train_config.seed)
+        torch.manual_seed(self.train_config.seed)
 
         L_shift = L_train + 1  # convert to {0, 1, ..., k}
         if L_shift.max() > self.cardinality:
@@ -738,8 +839,8 @@ class LabelModel(nn.Module):
                 f"L_train has cardinality {L_shift.max()}, cardinality={self.cardinality} passed in."
             )
 
-        self._set_class_balance(class_balance, Y_dev)
         self._set_constants(L_shift)
+        self._set_class_balance(class_balance, Y_dev)
         self._create_tree()
         lf_analysis = LFAnalysis(L_train)
         self.coverage = lf_analysis.lf_coverages()
@@ -758,6 +859,7 @@ class LabelModel(nn.Module):
         self.train()
 
         # Move model to GPU
+        self.mu_init = self.mu_init.to(self.config.device)
         if self.config.verbose and self.config.device != "cpu":  # pragma: no cover
             logging.info("Using GPU...")
         self.to(self.config.device)
@@ -799,50 +901,13 @@ class LabelModel(nn.Module):
             # Update learning rate
             self._update_lr_scheduler(epoch)
 
+        # Post-processing operations on mu
+        self._clamp_params()
+        self._break_col_permutation_symmetry()
+
+        # Return model to eval mode
         self.eval()
 
         # Print confusion matrix if applicable
         if self.config.verbose:  # pragma: no cover
             logging.info("Finished Training")
-
-    def save(self, destination: str, **kwargs: Any) -> None:
-        """Save label model.
-
-        Parameters
-        ----------
-        destination
-            File location for saving model
-        **kwargs
-            Arguments for torch.save
-
-        Example
-        -------
-        >>> label_model.save('./saved_label_model')  # doctest: +SKIP
-        """
-        with open(destination, "wb") as f:
-            torch.save(self, f, **kwargs)
-
-    @staticmethod
-    def load(source: str, **kwargs: Any) -> Any:
-        """Load existing label model.
-
-        Parameters
-        ----------
-        source
-            File location from where to load model
-        **kwargs
-            Arguments for torch.load
-
-        Returns
-        -------
-        LabelModel
-            LabelModel with appropriate loaded parameters
-
-        Example
-        -------
-        Load parameters saved in ``saved_label_model``
-
-        >>> label_model.load('./saved_label_model')  # doctest: +SKIP
-        """
-        with open(source, "rb") as f:
-            return torch.load(f, **kwargs)

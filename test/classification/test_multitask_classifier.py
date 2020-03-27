@@ -1,4 +1,5 @@
 import os
+import random
 import tempfile
 import unittest
 
@@ -14,7 +15,6 @@ from snorkel.classification import (
     Operation,
     Task,
 )
-from snorkel.utils import set_seed
 
 NUM_EXAMPLES = 10
 BATCH_SIZE = 2
@@ -26,6 +26,11 @@ class ClassifierTest(unittest.TestCase):
         cls.task1 = create_task("task1", module_suffixes=["A", "A"])
         cls.task2 = create_task("task2", module_suffixes=["B", "B"])
         cls.dataloader = create_dataloader("task1")
+
+    def setUp(self):
+        random.seed(123)
+        np.random.seed(123)
+        torch.manual_seed(123)
 
     def test_onetask_model(self):
         model = MultitaskClassifier(tasks=[self.task1])
@@ -167,8 +172,6 @@ class ClassifierTest(unittest.TestCase):
 
     def test_score_shuffled(self):
         # Test scoring with a shuffled dataset
-
-        set_seed(123)
 
         class SimpleVoter(nn.Module):
             def forward(self, x):

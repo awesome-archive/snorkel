@@ -51,6 +51,11 @@ class ScorerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Cannot score"):
             scorer.score([], [], [])
 
+    def test_no_probs(self) -> None:
+        scorer = Scorer()
+        golds, preds, probs = self._get_labels()
+        self.assertEqual(scorer.score(golds, preds), scorer.score(golds, preds, probs))
+
     def test_abstain_labels(self) -> None:
         # We abstain on the last example by convention (label=-1)
         golds = np.array([1, 0, 1, 0, -1])
@@ -63,10 +68,21 @@ class ScorerTest(unittest.TestCase):
         results_expected = dict(accuracy=0.6)
         self.assertEqual(results, results_expected)
 
-        # Test abstain=-1
+        # Test abstain=-1 for gold
         scorer = Scorer(metrics=["accuracy"], abstain_label=-1)
         results = scorer.score(golds, preds, probs)
         results_expected = dict(accuracy=0.75)
+        self.assertEqual(results, results_expected)
+
+        # Test abstain=-1 for preds and gold
+        abstain_preds = np.array([-1, -1, 1, 1, 0])
+        results = scorer.score(golds, abstain_preds)
+        results_expected = dict(accuracy=0.5)
+        self.assertEqual(results, results_expected)
+
+        scorer = Scorer(metrics=["coverage"], abstain_label=-1)
+        results = scorer.score(golds, abstain_preds)
+        results_expected = dict(coverage=0.6)
         self.assertEqual(results, results_expected)
 
         # Test abstain set to different value

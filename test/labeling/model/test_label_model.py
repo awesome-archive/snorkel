@@ -5,10 +5,11 @@ from typing import List
 
 import numpy as np
 import pytest
+import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from snorkel.labeling import LabelModel
+from snorkel.labeling.model import LabelModel
 from snorkel.labeling.model.label_model import TrainConfig
 from snorkel.synthetic.synthetic_data import generate_simple_label_matrix
 
@@ -29,14 +30,34 @@ class LabelModelTest(unittest.TestCase):
 
     def test_L_form(self):
         label_model = LabelModel(cardinality=2, verbose=False)
-        L = np.array([[0, 1, 0], [0, 1, 0], [1, 0, 0], [0, 1, 0]])
+        L = np.array([[-1, 1, -1], [-1, 1, -1], [1, -1, -1], [-1, 1, -1]])
         label_model._set_constants(L)
         self.assertEqual(label_model.n, 4)
         self.assertEqual(label_model.m, 3)
 
-        L = np.array([[0, 1, 2], [0, 1, 2], [1, 0, 2], [0, 1, 0]])
+        L = np.array([[-1, 0, 1], [-1, 0, 2], [0, -1, 2], [-1, 0, -1]])
         with self.assertRaisesRegex(ValueError, "L_train has cardinality"):
             label_model.fit(L, n_epochs=1)
+
+        L = np.array([[0, 1], [1, 1], [0, 1]])
+        with self.assertRaisesRegex(ValueError, "L_train should have at least 3"):
+            label_model.fit(L, n_epochs=1)
+
+    def test_mv_default(self):
+        # less than 2 LFs have overlaps
+        label_model = LabelModel(cardinality=2, verbose=False)
+        L = np.array([[-1, -1, 1], [-1, 1, -1], [0, -1, -1]])
+        label_model.fit(L, n_epochs=100)
+        np.testing.assert_array_almost_equal(
+            label_model.predict(L), np.array([1, 1, 0])
+        )
+
+        # less than 2 LFs have conflicts
+        L = np.array([[-1, -1, 1], [-1, 1, 1], [1, 1, 1]])
+        label_model.fit(L, n_epochs=100)
+        np.testing.assert_array_almost_equal(
+            label_model.predict(L), np.array([1, 1, 1])
+        )
 
     def test_class_balance(self):
         label_model = LabelModel(cardinality=2, verbose=False)
@@ -44,6 +65,20 @@ class LabelModelTest(unittest.TestCase):
         Y_dev = np.array([0, 0, 1, 1, 0, 0, 0, 0, 1, 1])
         label_model._set_class_balance(class_balance=None, Y_dev=Y_dev)
         np.testing.assert_array_almost_equal(label_model.p, np.array([0.6, 0.4]))
+
+        class_balance = np.array([0.0, 1.0])
+        with self.assertRaisesRegex(ValueError, "Class balance prior is 0"):
+            label_model._set_class_balance(class_balance=class_balance, Y_dev=Y_dev)
+
+        class_balance = np.array([0.0])
+        with self.assertRaisesRegex(ValueError, "class_balance has 1 entries."):
+            label_model._set_class_balance(class_balance=class_balance, Y_dev=Y_dev)
+
+        Y_dev_one_class = np.array([0, 0, 0])
+        with self.assertRaisesRegex(
+            ValueError, "Does not match LabelModel cardinality"
+        ):
+            label_model._set_class_balance(class_balance=None, Y_dev=Y_dev_one_class)
 
     def test_generate_O(self):
         L = np.array([[0, 1, 0], [0, 1, 0], [1, 0, 0], [0, 1, 1]])
@@ -60,7 +95,9 @@ class LabelModelTest(unittest.TestCase):
                 [1 / 4, 0, 0, 1 / 4, 0, 1 / 4],
             ]
         )
-        np.testing.assert_array_almost_equal(label_model.O.numpy(), true_O)
+        np.testing.assert_array_almost_equal(
+            label_model.O.cpu().detach().numpy(), true_O
+        )
 
         label_model = self._set_up_model(L)
         label_model._generate_O(L + 1, higher_order=False)
@@ -74,12 +111,16 @@ class LabelModelTest(unittest.TestCase):
                 [1 / 4, 0, 0, 1 / 4, 0, 1 / 4],
             ]
         )
-        np.testing.assert_array_almost_equal(label_model.O.numpy(), true_O)
+        np.testing.assert_array_almost_equal(
+            label_model.O.cpu().detach().numpy(), true_O
+        )
 
         # Higher order returns same matrix (num source = num cliques)
         # Need to test c_tree form
         label_model._generate_O(L + 1, higher_order=True)
-        np.testing.assert_array_almost_equal(label_model.O.numpy(), true_O)
+        np.testing.assert_array_almost_equal(
+            label_model.O.cpu().detach().numpy(), true_O
+        )
 
     def test_augmented_L_construction(self):
         # 5 LFs
@@ -120,9 +161,9 @@ class LabelModelTest(unittest.TestCase):
     def test_conditional_probs(self):
         L = np.array([[0, 1, 0], [0, 1, 0]])
         label_model = self._set_up_model(L, class_balance=[0.6, 0.4])
-        probs = label_model._get_conditional_probs()
-        self.assertLessEqual(probs.max(), 1.0)
-        self.assertGreaterEqual(probs.min(), 0.0)
+        cprobs = label_model.get_conditional_probs()
+        self.assertLessEqual(cprobs.max(), 1.0)
+        self.assertGreaterEqual(cprobs.min(), 0.0)
 
     def test_get_weight(self):
         # set up L matrix
@@ -197,7 +238,7 @@ class LabelModelTest(unittest.TestCase):
         L = np.array([[0, 1, 0], [0, 1, 0]])
         label_model = self._set_up_model(L)
 
-        label_model.mu = nn.Parameter(label_model.mu_init.clone())
+        label_model.mu = nn.Parameter(label_model.mu_init.clone().clamp(0.01, 0.99))
         probs = label_model.predict_proba(L)
 
         # with matching labels from 3 LFs, predicted probs clamped at (0.99,0.01)
@@ -205,10 +246,18 @@ class LabelModelTest(unittest.TestCase):
         np.testing.assert_array_almost_equal(probs, true_probs)
 
     def test_predict(self):
+        # 3 LFs that always disagree/abstain leads to all abstains
+        L = np.array([[-1, 1, 0], [0, -1, 1], [1, 0, -1]])
+        label_model = LabelModel(cardinality=2, verbose=False)
+        label_model.fit(L, n_epochs=100)
+        np.testing.assert_array_almost_equal(
+            label_model.predict(L), np.array([-1, -1, -1])
+        )
+
         L = np.array([[0, 1, 0], [0, 1, 0]])
         label_model = self._set_up_model(L)
 
-        label_model.mu = nn.Parameter(label_model.mu_init.clone())
+        label_model.mu = nn.Parameter(label_model.mu_init.clone().clamp(0.01, 0.99))
         preds = label_model.predict(L)
 
         true_preds = np.array([0, 0])
@@ -219,9 +268,21 @@ class LabelModelTest(unittest.TestCase):
         np.testing.assert_array_almost_equal(probs, true_probs)
 
     def test_score(self):
+        L = np.array([[1, 1, 0], [-1, -1, -1], [1, 0, 1]])
+        Y = np.array([1, 0, 1])
+        label_model = LabelModel(cardinality=2, verbose=False)
+        label_model.fit(L, n_epochs=100)
+        results = label_model.score(L, Y, metrics=["accuracy", "coverage"])
+        np.testing.assert_array_almost_equal(
+            label_model.predict(L), np.array([1, -1, 1])
+        )
+
+        results_expected = dict(accuracy=1.0, coverage=2 / 3)
+        self.assertEqual(results, results_expected)
+
         L = np.array([[1, 0, 1], [1, 0, 1]])
         label_model = self._set_up_model(L)
-        label_model.mu = nn.Parameter(label_model.mu_init.clone())
+        label_model.mu = nn.Parameter(label_model.mu_init.clone().clamp(0.01, 0.99))
 
         results = label_model.score(L, Y=np.array([0, 1]))
         results_expected = dict(accuracy=0.5)
@@ -233,9 +294,8 @@ class LabelModelTest(unittest.TestCase):
 
     def test_loss(self):
         L = np.array([[0, -1, 0], [0, 1, -1]])
-        label_model = self._set_up_model(L)
-        label_model._get_augmented_label_matrix(L + 1, higher_order=True)
-
+        label_model = LabelModel(cardinality=2, verbose=False)
+        label_model.fit(L, n_epochs=1)
         label_model.mu = nn.Parameter(label_model.mu_init.clone() + 0.05)
 
         # l2_loss = l2*M*K*||mu - mu_init||_2 = 3*2*(0.05^2) = 0.03
@@ -281,14 +341,21 @@ class LabelModelTest(unittest.TestCase):
             label_model.fit(L, n_epochs=1, lr_scheduler="bad_scheduler")
 
     def test_save_and_load(self):
-        L = np.array([[0, -1, 0], [0, 1, 0]])
+        L = np.array([[0, -1, 0], [0, 1, 1]])
         label_model = LabelModel(cardinality=2, verbose=False)
         label_model.fit(L, n_epochs=1)
+        original_preds = label_model.predict(L)
+
         dir_path = tempfile.mkdtemp()
-        save_path = dir_path + "label_model"
+        save_path = dir_path + "label_model.pkl"
         label_model.save(save_path)
-        label_model.load(save_path)
+
+        label_model_new = LabelModel(cardinality=2, verbose=False)
+        label_model_new.load(save_path)
+        loaded_preds = label_model_new.predict(L)
         shutil.rmtree(dir_path)
+
+        np.testing.assert_array_equal(loaded_preds, original_preds)
 
     def test_optimizer_init(self):
         L = np.array([[0, -1, 0], [0, 1, 0]])
@@ -340,6 +407,87 @@ class LabelModelTest(unittest.TestCase):
             lr_scheduler_config = {"warmup_steps": 1, "warmup_unit": "batches"}
             label_model.fit(L, lr_scheduler_config=lr_scheduler_config)
 
+    def test_set_mu_eps(self):
+        mu_eps = 0.0123
+
+        # Construct a label matrix such that P(\lambda_1 = 0 | Y) = 0.0, so it will hit
+        # the mu_eps floor
+        L = np.array([[1, 1, 1], [1, 1, 1]])
+        label_model = LabelModel(verbose=False)
+        label_model.fit(L, mu_eps=mu_eps)
+        self.assertAlmostEqual(label_model.get_conditional_probs()[0, 1, 0], mu_eps)
+
+    def test_symmetry_breaking(self):
+        mu = np.array(
+            [
+                # LF 0
+                [0.75, 0.25],
+                [0.25, 0.75],
+                # LF 1
+                [0.25, 0.75],
+                [0.15, 0.25],
+                # LF 2
+                [0.75, 0.25],
+                [0.25, 0.75],
+            ]
+        )
+        mu = mu[:, [1, 0]]
+
+        # First test: Two "good" LFs
+        label_model = LabelModel(verbose=False)
+        label_model._set_class_balance(None, None)
+        label_model.m = 3
+        label_model.mu = nn.Parameter(torch.from_numpy(mu))
+        label_model._break_col_permutation_symmetry()
+        self.assertEqual(label_model.mu.data[0, 0], 0.75)
+
+        # Test with non-uniform class balance
+        # It should not consider the "correct" permutation as does not commute now
+        label_model = LabelModel(verbose=False)
+        label_model._set_class_balance([0.9, 0.1], None)
+        label_model.m = 3
+        label_model.mu = nn.Parameter(torch.from_numpy(mu))
+        label_model._break_col_permutation_symmetry()
+        self.assertEqual(label_model.mu.data[0, 0], 0.25)
+
+    def test_symmetry_breaking_multiclass(self):
+        mu = np.array(
+            [
+                # LF 0
+                [0.75, 0.15, 0.1],
+                [0.20, 0.75, 0.3],
+                [0.05, 0.10, 0.6],
+                # LF 1
+                [0.25, 0.55, 0.3],
+                [0.15, 0.45, 0.4],
+                [0.20, 0.00, 0.3],
+                # LF 2
+                [0.5, 0.15, 0.2],
+                [0.3, 0.65, 0.2],
+                [0.2, 0.20, 0.6],
+            ]
+        )
+        mu = mu[:, [1, 2, 0]]
+
+        # First test: Two "good" LFs
+        label_model = LabelModel(cardinality=3, verbose=False)
+        label_model._set_class_balance(None, None)
+        label_model.m = 3
+        label_model.mu = nn.Parameter(torch.from_numpy(mu))
+        label_model._break_col_permutation_symmetry()
+        self.assertEqual(label_model.mu.data[0, 0], 0.75)
+        self.assertEqual(label_model.mu.data[1, 1], 0.75)
+
+        # Test with non-uniform class balance
+        # It should not consider the "correct" permutation as it does not commute
+        label_model = LabelModel(cardinality=3, verbose=False)
+        label_model._set_class_balance([0.7, 0.2, 0.1], None)
+        label_model.m = 3
+        label_model.mu = nn.Parameter(torch.from_numpy(mu))
+        label_model._break_col_permutation_symmetry()
+        self.assertEqual(label_model.mu.data[0, 0], 0.15)
+        self.assertEqual(label_model.mu.data[1, 1], 0.3)
+
 
 @pytest.mark.complex
 class TestLabelModelAdvanced(unittest.TestCase):
@@ -351,8 +499,8 @@ class TestLabelModelAdvanced(unittest.TestCase):
         self.n = 10000  # Number of data points
         self.cardinality = 2  # Number of classes
 
-    def test_label_model(self) -> None:
-        """Test the LabelModel's estimate of P and Y."""
+    def test_label_model_basic(self) -> None:
+        """Test the LabelModel's estimate of P and Y on a simple synthetic dataset."""
         np.random.seed(123)
         P, Y, L = generate_simple_label_matrix(self.n, self.m, self.cardinality)
 
@@ -361,15 +509,41 @@ class TestLabelModelAdvanced(unittest.TestCase):
         label_model.fit(L, n_epochs=200, lr=0.01, seed=123)
 
         # Test estimated LF conditional probabilities
-        P_lm = label_model._get_conditional_probs().reshape(
-            (self.m, self.cardinality + 1, -1)
-        )
+        P_lm = label_model.get_conditional_probs()
         np.testing.assert_array_almost_equal(P, P_lm, decimal=2)
 
         # Test predicted labels
-        Y_lm = label_model.predict_proba(L).argmax(axis=1)
-        err = np.where(Y != Y_lm, 1, 0).sum() / self.n
-        self.assertLess(err, 0.1)
+        score = label_model.score(L, Y)
+        self.assertGreaterEqual(score["accuracy"], 0.9)
+
+    def test_label_model_sparse(self) -> None:
+        """Test the LabelModel's estimate of P and Y on a sparse synthetic dataset.
+
+        This tests the common setting where LFs abstain most of the time, which can
+        cause issues for example if parameter clamping set too high (e.g. see Issue
+        #1422).
+        """
+        np.random.seed(123)
+        P, Y, L = generate_simple_label_matrix(
+            self.n, self.m, self.cardinality, abstain_multiplier=1000.0
+        )
+
+        # Train LabelModel
+        label_model = LabelModel(cardinality=self.cardinality, verbose=False)
+        label_model.fit(L, n_epochs=1000, lr=0.01, seed=123)
+
+        # Test estimated LF conditional probabilities
+        P_lm = label_model.get_conditional_probs()
+        np.testing.assert_array_almost_equal(P, P_lm, decimal=2)
+
+        # Test predicted labels *only on non-abstained data points*
+        Y_pred = label_model.predict(L, tie_break_policy="abstain")
+        (idx,) = np.where(Y_pred != -1)
+        acc = np.where(Y_pred[idx] == Y[idx], 1, 0).sum() / len(idx)
+        self.assertGreaterEqual(acc, 0.65)
+
+        # Make sure that we don't output abstain when an LF votes, per issue #1422
+        self.assertEqual(len(idx), np.where((L + 1).sum(axis=1) != 0, 1, 0).sum())
 
 
 if __name__ == "__main__":

@@ -44,18 +44,24 @@ class Scorer:
     ) -> None:
 
         self.metrics: Dict[str, Callable[..., float]]
+        self.metrics = {}
         if metrics:
             for metric in metrics:
                 if metric not in METRICS:
                     raise ValueError(f"Unrecognized metric: {metric}")
 
-            filter_dict = {} if abstain_label is None else {"golds": [abstain_label]}
-            self.metrics = {
-                m: partial(metric_score, metric=m, filter_dict=filter_dict)
-                for m in metrics
-            }
-        else:
-            self.metrics = {}
+                filter_dict = (
+                    {}
+                    if abstain_label is None or metric == "coverage"
+                    else {"golds": [abstain_label], "preds": [abstain_label]}
+                )
+                self.metrics.update(
+                    {
+                        metric: partial(
+                            metric_score, metric=metric, filter_dict=filter_dict
+                        )
+                    }
+                )
 
         if custom_metric_funcs is not None:
             self.metrics.update(custom_metric_funcs)
@@ -63,18 +69,25 @@ class Scorer:
         self.abstain_label = abstain_label
 
     def score(
-        self, golds: np.ndarray, preds: np.ndarray, probs: np.ndarray
+        self,
+        golds: np.ndarray,
+        preds: Optional[np.ndarray] = None,
+        probs: Optional[np.ndarray] = None,
     ) -> Dict[str, float]:
-        """Calculate one or more scores from user-specified and/or user-defined metrics.
+        """Calculate scores for one or more user-specified metrics.
 
         Parameters
         ----------
         golds
-            Gold (aka ground truth) labels (integers)
+            An array of gold (int) labels to base scores on
         preds
-            Predictions (integers)
-        probs:
-            Probabilities (floats)
+            An [n_datapoints,] or [n_datapoints, 1] array of (int) predictions to score
+        probs
+            An [n_datapoints, n_classes] array of probabilistic (float) predictions
+
+        Because most metrics require either `preds` or `probs`, but not both, these
+        values are optional; it is up to the metric function that will be called  to
+        raise an exception if a field it requires is not passed to the `score()` method.
 
         Returns
         -------

@@ -1,16 +1,7 @@
 import hashlib
-import random
 from typing import Dict, List
 
 import numpy as np
-import torch
-
-
-def set_seed(seed: int) -> None:
-    """Set the Python, NumPy, and PyTorch random seeds."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
 
 
 def _hash(i: int) -> int:
@@ -130,6 +121,8 @@ def to_int_label_array(X: np.ndarray, flatten_vector: bool = True) -> np.ndarray
     # Correct shape
     if flatten_vector:
         X = X.squeeze()
+        if X.ndim == 0:
+            X = np.expand_dims(X, 0)
         if X.ndim != 1:
             raise ValueError("Input could not be converted to 1d np.array")
     return X
